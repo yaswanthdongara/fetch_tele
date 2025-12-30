@@ -11,12 +11,10 @@ app.use(express.json());
 const bot = new TelegramBot(process.env.BOT_TOKEN);
 const PORT = process.env.PORT || 3000;
 
-/* ===============================
-   ROUTES
-   =============================== */
+/* ---------------- ROUTES ---------------- */
 
 app.get("/", (req, res) => {
-  res.send("🤖 Telegram GitHub Downloader Bot is running");
+  res.send("🤖 Telegram GitHub File Fetch Bot is running");
 });
 
 app.post("/webhook", (req, res) => {
@@ -24,16 +22,10 @@ app.post("/webhook", (req, res) => {
   res.sendStatus(200);
 });
 
-/* ===============================
-   HELPERS
-   =============================== */
+/* ---------------- HELPERS ---------------- */
 
-// Detect and parse GitHub repo URL
 function parseGitHubRepoUrl(text) {
-  const match = text.match(
-    /^https?:\/\/github\.com\/([^/]+)\/([^/\s]+)(?:\/)?$/
-  );
-
+  const match = text.match(/^https?:\/\/github\.com\/([^/]+)\/([^/\s]+)/);
   if (!match) return null;
 
   return {
@@ -42,19 +34,30 @@ function parseGitHubRepoUrl(text) {
   };
 }
 
-/* ===============================
-   BOT LOGIC
-   =============================== */
-
-// Start message
-bot.onText(/\/start/, (msg) => {
-  bot.sendMessage(
-    msg.chat.id,
-    "👋 Just send a GitHub repository URL.\n\nExample:\nhttps://github.com/username/repository"
+// Get default branch
+async function getDefaultBranch(owner, repo) {
+  const res = await fetch(
+    `https://api.github.com/repos/${owner}/${repo}`,
+    { headers: { "User-Agent": "telegram-github-bot" } }
   );
-});
+  const data = await res.json();
+  return data.default_branch;
+}
 
-// 🔥 MAIN LOGIC: listen to ALL messages
+// Get all files using Tree API
+async function getAllFiles(owner, repo, branch) {
+  const res = await fetch(
+    `https://api.github.com/repos/${owner}/${repo}/git/trees/${branch}?recursive=1`,
+    { headers: { "User-Agent": "telegram-github-bot" } }
+  );
+
+  const data = await res.json();
+
+  return data.tree.filter(item => item.type === "blob");
+}
+
+/* ---------------- BOT LOGIC ---------------- */
+
 bot.on("message", async (msg) => {
   const chatId = msg.chat.id;
   const text = msg.text;
@@ -62,41 +65,44 @@ bot.on("message", async (msg) => {
   if (!text) return;
 
   const parsed = parseGitHubRepoUrl(text);
-  if (!parsed) return; // ignore non-GitHub messages
+  if (!parsed) return;
 
   const { owner, repo } = parsed;
-  const zipUrl = `https://api.github.com/repos/${owner}/${repo}/zipball`;
 
   try {
-    await bot.sendMessage(chatId, "⏳ Downloading repository…");
+    await bot.sendMessage(chatId, "⏳ Fetching repository files…");
 
-    const response = await fetch(zipUrl, {
-      headers: {
-        "User-Agent": "telegram-github-downloader"
-      }
-    });
+    const branch = await getDefaultBranch(owner, repo);
+    const files = await getAllFiles(owner, repo, branch);
 
-    if (!response.ok) {
-      throw new Error("GitHub ZIP download failed");
+    if (!files.length) {
+      return bot.sendMessage(chatId, "⚠️ No files found");
     }
 
-    const buffer = await response.buffer();
+    for (const file of files) {
+      const rawUrl = `https://raw.githubusercontent.com/${owner}/${repo}/${branch}/${file.path}`;
 
-    await bot.sendDocument(chatId, buffer, {}, {
-      filename: `${repo}.zip`
-    });
+      const res = await fetch(rawUrl);
+      const arrayBuffer = await res.arrayBuffer();
+      const buffer = Buffer.from(arrayBuffer);
 
-    await bot.sendMessage(chatId, "✅ Repository downloaded successfully");
+      await bot.sendDocument(chatId, buffer, {}, {
+        filename: file.path.split("/").pop()
+      });
+    }
 
-  } catch (error) {
-    console.error(error);
-    bot.sendMessage(chatId, "❌ Failed to download repository");
+    await bot.sendMessage(
+      chatId,
+      `✅ Sent ${files.length} files successfully`
+    );
+
+  } catch (err) {
+    console.error(err);
+    bot.sendMessage(chatId, "❌ Failed to fetch repository files");
   }
 });
 
-/* ===============================
-   SERVER
-   =============================== */
+/* ---------------- SERVER ---------------- */
 
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
