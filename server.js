@@ -34,25 +34,39 @@ function parseGitHubRepoUrl(text) {
   };
 }
 
-// Get default branch
+const GH_HEADERS = {
+  "User-Agent": "telegram-github-bot",
+  "Accept": "application/vnd.github+json"
+};
+
 async function getDefaultBranch(owner, repo) {
   const res = await fetch(
     `https://api.github.com/repos/${owner}/${repo}`,
-    { headers: { "User-Agent": "telegram-github-bot" } }
+    { headers: GH_HEADERS }
   );
+  if (!res.ok) throw new Error("Repo fetch failed");
   const data = await res.json();
   return data.default_branch;
 }
 
-// Get all files using Tree API
-async function getAllFiles(owner, repo, branch) {
+async function getBranchCommitSha(owner, repo, branch) {
   const res = await fetch(
-    `https://api.github.com/repos/${owner}/${repo}/git/trees/${branch}?recursive=1`,
-    { headers: { "User-Agent": "telegram-github-bot" } }
+    `https://api.github.com/repos/${owner}/${repo}/git/refs/heads/${branch}`,
+    { headers: GH_HEADERS }
   );
+  if (!res.ok) throw new Error("Branch ref fetch failed");
+  const data = await res.json();
+  return data.object.sha;
+}
+
+async function getAllFiles(owner, repo, commitSha) {
+  const res = await fetch(
+    `https://api.github.com/repos/${owner}/${repo}/git/trees/${commitSha}?recursive=1`,
+    { headers: GH_HEADERS }
+  );
+  if (!res.ok) throw new Error("Tree fetch failed");
 
   const data = await res.json();
-
   return data.tree.filter(item => item.type === "blob");
 }
 
@@ -73,7 +87,8 @@ bot.on("message", async (msg) => {
     await bot.sendMessage(chatId, "⏳ Fetching repository files…");
 
     const branch = await getDefaultBranch(owner, repo);
-    const files = await getAllFiles(owner, repo, branch);
+    const commitSha = await getBranchCommitSha(owner, repo, branch);
+    const files = await getAllFiles(owner, repo, commitSha);
 
     if (!files.length) {
       return bot.sendMessage(chatId, "⚠️ No files found");
@@ -83,6 +98,8 @@ bot.on("message", async (msg) => {
       const rawUrl = `https://raw.githubusercontent.com/${owner}/${repo}/${branch}/${file.path}`;
 
       const res = await fetch(rawUrl);
+      if (!res.ok) continue;
+
       const arrayBuffer = await res.arrayBuffer();
       const buffer = Buffer.from(arrayBuffer);
 
