@@ -12,105 +12,85 @@ const bot = new TelegramBot(process.env.BOT_TOKEN);
 const PORT = process.env.PORT || 3000;
 
 /* ===============================
-   BASIC ROUTES
+   ROUTES
    =============================== */
 
-// Health check
 app.get("/", (req, res) => {
-  res.send("🤖 Telegram GitHub Repo Fetch Bot is running");
+  res.send("🤖 Telegram GitHub Downloader Bot is running");
 });
 
-// Webhook
 app.post("/webhook", (req, res) => {
   bot.processUpdate(req.body);
   res.sendStatus(200);
 });
 
 /* ===============================
-   HELPER FUNCTIONS
+   HELPERS
    =============================== */
 
-// Extract owner & repo from GitHub URL
-function parseRepoUrl(url) {
-  const match = url.match(/github\.com\/([^/]+)\/([^/]+)/);
+// Detect and parse GitHub repo URL
+function parseGitHubRepoUrl(text) {
+  const match = text.match(
+    /^https?:\/\/github\.com\/([^/]+)\/([^/\s]+)(?:\/)?$/
+  );
+
   if (!match) return null;
-  return { owner: match[1], repo: match[2] };
-}
 
-// Recursively fetch all files
-async function fetchFiles(owner, repo, path = "") {
-  const apiUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${path}`;
-  const response = await fetch(apiUrl);
-
-  if (!response.ok) {
-    throw new Error("GitHub API error");
-  }
-
-  const data = await response.json();
-  let files = [];
-
-  for (const item of data) {
-    if (item.type === "file") {
-      files.push({
-        name: item.name,
-        download_url: item.download_url
-      });
-    } else if (item.type === "dir") {
-      const subFiles = await fetchFiles(owner, repo, item.path);
-      files = files.concat(subFiles);
-    }
-  }
-
-  return files;
+  return {
+    owner: match[1],
+    repo: match[2].replace(".git", "")
+  };
 }
 
 /* ===============================
-   BOT COMMANDS
+   BOT LOGIC
    =============================== */
 
-// Start command
+// Start message
 bot.onText(/\/start/, (msg) => {
   bot.sendMessage(
     msg.chat.id,
-    "👋 Send a GitHub repo URL:\n\n/repo https://github.com/username/repository"
+    "👋 Just send a GitHub repository URL.\n\nExample:\nhttps://github.com/username/repository"
   );
 });
 
-// Repo command
-bot.onText(/\/repo (.+)/, async (msg, match) => {
+// 🔥 MAIN LOGIC: listen to ALL messages
+bot.on("message", async (msg) => {
   const chatId = msg.chat.id;
-  const repoUrl = match[1];
+  const text = msg.text;
 
-  const parsed = parseRepoUrl(repoUrl);
-  if (!parsed) {
-    return bot.sendMessage(chatId, "❌ Invalid GitHub repository URL");
-  }
+  if (!text) return;
+
+  const parsed = parseGitHubRepoUrl(text);
+  if (!parsed) return; // ignore non-GitHub messages
 
   const { owner, repo } = parsed;
+  const zipUrl = `https://api.github.com/repos/${owner}/${repo}/zipball`;
 
   try {
-    bot.sendMessage(chatId, "⏳ Fetching files, please wait...");
+    await bot.sendMessage(chatId, "⏳ Downloading repository…");
 
-    const files = await fetchFiles(owner, repo);
+    const response = await fetch(zipUrl, {
+      headers: {
+        "User-Agent": "telegram-github-downloader"
+      }
+    });
 
-    if (files.length === 0) {
-      return bot.sendMessage(chatId, "⚠️ No downloadable files found");
+    if (!response.ok) {
+      throw new Error("GitHub ZIP download failed");
     }
 
-    for (const file of files) {
-      const res = await fetch(file.download_url);
-      const buffer = await res.buffer();
+    const buffer = await response.buffer();
 
-      await bot.sendDocument(chatId, buffer, {}, {
-        filename: file.name
-      });
-    }
+    await bot.sendDocument(chatId, buffer, {}, {
+      filename: `${repo}.zip`
+    });
 
-    bot.sendMessage(chatId, `✅ Sent ${files.length} files successfully`);
+    await bot.sendMessage(chatId, "✅ Repository downloaded successfully");
 
   } catch (error) {
     console.error(error);
-    bot.sendMessage(chatId, "❌ Error fetching repository files");
+    bot.sendMessage(chatId, "❌ Failed to download repository");
   }
 });
 
