@@ -5,26 +5,90 @@ import dotenv from "dotenv";
 
 dotenv.config();
 
+/* ===============================
+   BASIC SETUP
+   =============================== */
+
 const app = express();
 app.use(express.json());
 
 const bot = new TelegramBot(process.env.BOT_TOKEN);
 const PORT = process.env.PORT || 3000;
 
+/* ===============================
+   GITHUB HEADERS (RATE LIMIT FIX)
+   =============================== */
+
 const GH_HEADERS = {
   "User-Agent": "telegram-github-bot",
   "Accept": "application/vnd.github+json",
-  ...(process.env.GITHUB_TOKEN && {
-    "Authorization": `Bearer ${process.env.GITHUB_TOKEN}`
-  })
+  "Authorization": `Bearer ${process.env.GITHUB_TOKEN}`
 };
 
-app.get("/", (req, res) => res.send("Bot running"));
+/* ===============================
+   ROUTES
+   =============================== */
+
+app.get("/", (req, res) => {
+  res.send("🤖 Telegram GitHub File Fetch Bot is running");
+});
 
 app.post("/webhook", (req, res) => {
   bot.processUpdate(req.body);
   res.sendStatus(200);
 });
+
+/* ===============================
+   HELPERS
+   =============================== */
+
+// Extract owner & repo from GitHub URL
+function parseGitHubRepoUrl(text) {
+  const match = text.match(/^https?:\/\/github\.com\/([^/]+)\/([^/\s]+)/);
+  if (!match) return null;
+
+  return {
+    owner: match[1],
+    repo: match[2].replace(".git", "")
+  };
+}
+
+// Get default branch
+async function getDefaultBranch(owner, repo) {
+  const res = await fetch(
+    `https://api.github.com/repos/${owner}/${repo}`,
+    { headers: GH_HEADERS }
+  );
+  if (!res.ok) throw new Error("Failed to fetch repo");
+  const data = await res.json();
+  return data.default_branch;
+}
+
+// Get commit SHA of branch
+async function getCommitSha(owner, repo, branch) {
+  const res = await fetch(
+    `https://api.github.com/repos/${owner}/${repo}/git/refs/heads/${branch}`,
+    { headers: GH_HEADERS }
+  );
+  if (!res.ok) throw new Error("Failed to fetch branch SHA");
+  const data = await res.json();
+  return data.object.sha;
+}
+
+// Get all files using Tree API
+async function getAllFiles(owner, repo, sha) {
+  const res = await fetch(
+    `https://api.github.com/repos/${owner}/${repo}/git/trees/${sha}?recursive=1`,
+    { headers: GH_HEADERS }
+  );
+  if (!res.ok) throw new Error("Failed to fetch tree");
+  const data = await res.json();
+  return data.tree.filter(item => item.type === "blob");
+}
+
+/* ===============================
+   BOT LOGIC
+   =============================== */
 
 bot.on("message", async (msg) => {
   const chatId = msg.chat.id;
@@ -32,70 +96,50 @@ bot.on("message", async (msg) => {
 
   if (!text) return;
 
-  const match = text.match(/^https?:\/\/github\.com\/([^/]+)\/([^/\s]+)/);
-  if (!match) return;
+  const parsed = parseGitHubRepoUrl(text);
+  if (!parsed) return; // ignore non-GitHub messages
 
-  const owner = match[1];
-  const repo = match[2];
+  const { owner, repo } = parsed;
 
   try {
-    // 🔎 DEBUG: confirm token
-    await bot.sendMessage(chatId, `TOKEN PRESENT: ${!!process.env.GITHUB_TOKEN}`);
+    await bot.sendMessage(chatId, "⏳ Fetching repository files…");
 
-    const repoRes = await fetch(
-      `https://api.github.com/repos/${owner}/${repo}`,
-      { headers: GH_HEADERS }
-    );
+    const branch = await getDefaultBranch(owner, repo);
+    const sha = await getCommitSha(owner, repo, branch);
+    const files = await getAllFiles(owner, repo, sha);
 
-    if (!repoRes.ok) {
-      const t = await repoRes.text();
-      throw new Error(`REPO ${repoRes.status}: ${t}`);
+    if (!files.length) {
+      return bot.sendMessage(chatId, "⚠️ No files found in repository");
     }
 
-    const repoJson = await repoRes.json();
-    const branch = repoJson.default_branch;
+    for (const file of files) {
+      const rawUrl = `https://raw.githubusercontent.com/${owner}/${repo}/${branch}/${file.path}`;
+      const res = await fetch(rawUrl);
 
-    const refRes = await fetch(
-      `https://api.github.com/repos/${owner}/${repo}/git/refs/heads/${branch}`,
-      { headers: GH_HEADERS }
-    );
+      if (!res.ok) continue;
 
-    if (!refRes.ok) {
-      const t = await refRes.text();
-      throw new Error(`REF ${refRes.status}: ${t}`);
-    }
+      const arrayBuffer = await res.arrayBuffer();
+      const buffer = Buffer.from(arrayBuffer);
 
-    const refJson = await refRes.json();
-    const sha = refJson.object.sha;
-
-    const treeRes = await fetch(
-      `https://api.github.com/repos/${owner}/${repo}/git/trees/${sha}?recursive=1`,
-      { headers: GH_HEADERS }
-    );
-
-    if (!treeRes.ok) {
-      const t = await treeRes.text();
-      throw new Error(`TREE ${treeRes.status}: ${t}`);
-    }
-
-    const treeJson = await treeRes.json();
-    const files = treeJson.tree.filter(f => f.type === "blob");
-
-    for (const f of files) {
-      const rawUrl = `https://raw.githubusercontent.com/${owner}/${repo}/${branch}/${f.path}`;
-      const r = await fetch(rawUrl);
-      const buf = Buffer.from(await r.arrayBuffer());
-
-      await bot.sendDocument(chatId, buf, {}, {
-        filename: f.path.split("/").pop()
+      // ✅ CORRECT TELEGRAM FILE UPLOAD
+      await bot.sendDocument(chatId, {
+        source: buffer,
+        filename: file.path.split("/").pop()
       });
     }
 
-    await bot.sendMessage(chatId, `✅ Sent ${files.length} files`);
+    await bot.sendMessage(chatId, `✅ Sent ${files.length} files successfully`);
 
   } catch (err) {
-    await bot.sendMessage(chatId, `❌ ERROR:\n${err.message.slice(0, 350)}`);
+    console.error(err);
+    await bot.sendMessage(chatId, `❌ Error: ${err.message}`);
   }
 });
 
-app.listen(PORT, () => console.log("Server running"));
+/* ===============================
+   SERVER
+   =============================== */
+
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
