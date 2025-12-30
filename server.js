@@ -17,7 +17,7 @@ const bot = new TelegramBot(process.env.BOT_TOKEN);
 const PORT = process.env.PORT || 3000;
 
 /* ===============================
-   GITHUB HEADERS
+   GITHUB HEADERS (RATE LIMIT SAFE)
    =============================== */
 
 const GH_HEADERS = {
@@ -31,7 +31,7 @@ const GH_HEADERS = {
    =============================== */
 
 app.get("/", (req, res) => {
-  res.send("🤖 Telegram GitHub File Fetch Bot running");
+  res.send("🤖 Telegram GitHub File Fetch Bot is running");
 });
 
 app.post("/webhook", (req, res) => {
@@ -40,43 +40,51 @@ app.post("/webhook", (req, res) => {
 });
 
 /* ===============================
-   HELPERS
+   HELPER FUNCTIONS
    =============================== */
 
+// Parse GitHub repository URL
 function parseGitHubRepoUrl(text) {
-  const m = text.match(/^https?:\/\/github\.com\/([^/]+)\/([^/\s]+)/);
-  if (!m) return null;
-  return { owner: m[1], repo: m[2].replace(".git", "") };
+  const match = text.match(/^https?:\/\/github\.com\/([^/]+)\/([^/\s]+)/);
+  if (!match) return null;
+
+  return {
+    owner: match[1],
+    repo: match[2].replace(".git", "")
+  };
 }
 
+// Get default branch
 async function getDefaultBranch(owner, repo) {
-  const r = await fetch(
+  const res = await fetch(
     `https://api.github.com/repos/${owner}/${repo}`,
     { headers: GH_HEADERS }
   );
-  if (!r.ok) throw new Error("Repo fetch failed");
-  const j = await r.json();
-  return j.default_branch;
+  if (!res.ok) throw new Error("Failed to fetch repository");
+  const data = await res.json();
+  return data.default_branch;
 }
 
+// Get commit SHA
 async function getCommitSha(owner, repo, branch) {
-  const r = await fetch(
+  const res = await fetch(
     `https://api.github.com/repos/${owner}/${repo}/git/refs/heads/${branch}`,
     { headers: GH_HEADERS }
   );
-  if (!r.ok) throw new Error("Branch ref fetch failed");
-  const j = await r.json();
-  return j.object.sha;
+  if (!res.ok) throw new Error("Failed to fetch branch SHA");
+  const data = await res.json();
+  return data.object.sha;
 }
 
+// Get all files using Tree API
 async function getAllFiles(owner, repo, sha) {
-  const r = await fetch(
+  const res = await fetch(
     `https://api.github.com/repos/${owner}/${repo}/git/trees/${sha}?recursive=1`,
     { headers: GH_HEADERS }
   );
-  if (!r.ok) throw new Error("Tree fetch failed");
-  const j = await r.json();
-  return j.tree.filter(x => x.type === "blob");
+  if (!res.ok) throw new Error("Failed to fetch file tree");
+  const data = await res.json();
+  return data.tree.filter(item => item.type === "blob");
 }
 
 /* ===============================
@@ -89,7 +97,7 @@ bot.on("message", async (msg) => {
   if (!text) return;
 
   const parsed = parseGitHubRepoUrl(text);
-  if (!parsed) return;
+  if (!parsed) return; // Ignore non-GitHub messages
 
   const { owner, repo } = parsed;
 
@@ -101,7 +109,7 @@ bot.on("message", async (msg) => {
     const files = await getAllFiles(owner, repo, sha);
 
     if (!files.length) {
-      await bot.sendMessage(chatId, "⚠️ No files found");
+      await bot.sendMessage(chatId, "⚠️ No files found in repository");
       return;
     }
 
@@ -109,25 +117,31 @@ bot.on("message", async (msg) => {
       const rawUrl =
         `https://raw.githubusercontent.com/${owner}/${repo}/${branch}/${f.path}`;
 
-      const r = await fetch(rawUrl);
-      if (!r.ok) continue;
+      const res = await fetch(rawUrl);
+      if (!res.ok) continue;
 
-      const buffer = Buffer.from(await r.arrayBuffer());
+      const buffer = Buffer.from(await res.arrayBuffer());
       if (!buffer.length) continue;
 
-      // ✅ STREAM FIX (THIS SOLVES EVERYTHING)
       const stream = Readable.from(buffer);
 
+      // Telegram-safe filename
+      const safeFilename = f.path.replace(/\//g, "__");
+
+      // 1️⃣ Send file
       await bot.sendDocument(chatId, stream, {
-        filename: f.path.split("/").pop()
+        filename: safeFilename
       });
+
+      // 2️⃣ Send exact GitHub path under the file
+      await bot.sendMessage(chatId, `📄 ${f.path}`);
     }
 
-    await bot.sendMessage(chatId, `✅ Sent ${files.length} files`);
+    await bot.sendMessage(chatId, `✅ Sent ${files.length} files successfully`);
 
   } catch (err) {
     console.error(err);
-    await bot.sendMessage(chatId, `❌ ${err.message}`);
+    await bot.sendMessage(chatId, `❌ Error: ${err.message}`);
   }
 });
 
