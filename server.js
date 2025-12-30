@@ -27,18 +27,18 @@ const GH_HEADERS = {
 };
 
 /* ===============================
-   IN-MEMORY SESSION STORE
-   (simple & enough for Render free)
+   SESSION STORE
    =============================== */
 
-const sessions = new Map();
+const sessions = new Map(); 
+// chatId -> { owner, repo, branch, tree, path, page }
 
 /* ===============================
    ROUTES
    =============================== */
 
-app.get("/", (req, res) => {
-  res.send("🤖 Telegram GitHub File Selector Bot is running");
+app.get("/", (_, res) => {
+  res.send("🤖 Telegram GitHub File Navigator Bot running");
 });
 
 app.post("/webhook", (req, res) => {
@@ -74,17 +74,47 @@ async function getCommitSha(owner, repo, branch) {
   return j.object.sha;
 }
 
-async function getAllFiles(owner, repo, sha) {
+async function getTree(owner, repo, sha) {
   const r = await fetch(
     `https://api.github.com/repos/${owner}/${repo}/git/trees/${sha}?recursive=1`,
     { headers: GH_HEADERS }
   );
   const j = await r.json();
-  return j.tree.filter(x => x.type === "blob");
+  return j.tree;
+}
+
+function getEntries(tree, path) {
+  const prefix = path ? `${path}/` : "";
+  const depth = prefix.split("/").length;
+
+  return tree.filter(item => {
+    if (!item.path.startsWith(prefix)) return false;
+    return item.path.split("/").length === depth;
+  });
+}
+
+function buildKeyboard(entries, page) {
+  const PAGE_SIZE = 8;
+  const start = page * PAGE_SIZE;
+  const slice = entries.slice(start, start + PAGE_SIZE);
+
+  const rows = slice.map(e => [{
+    text: e.type === "tree" ? `📂 ${e.path.split("/").pop()}` : `📄 ${e.path.split("/").pop()}`,
+    callback_data: `${e.type}:${e.path}`
+  }]);
+
+  const nav = [];
+  if (page > 0) nav.push({ text: "⏮ Prev", callback_data: "nav:prev" });
+  if (start + PAGE_SIZE < entries.length) nav.push({ text: "Next ⏭", callback_data: "nav:next" });
+
+  if (nav.length) rows.push(nav);
+  rows.push([{ text: "🔎 Search", callback_data: "search" }]);
+
+  return rows;
 }
 
 /* ===============================
-   BOT LOGIC
+   BOT MESSAGE HANDLER
    =============================== */
 
 bot.on("message", async (msg) => {
@@ -92,88 +122,109 @@ bot.on("message", async (msg) => {
   const text = msg.text;
   if (!text) return;
 
+  // SEARCH MODE
+  const session = sessions.get(chatId);
+  if (session?.searching) {
+    const keyword = text.toLowerCase();
+    const matches = session.tree.filter(
+      f => f.type === "blob" && f.path.toLowerCase().includes(keyword)
+    );
+
+    if (!matches.length) {
+      await bot.sendMessage(chatId, "❌ No matching files found");
+      return;
+    }
+
+    session.entries = matches;
+    session.page = 0;
+    session.searching = false;
+
+    await bot.sendMessage(chatId, "🔎 Search results:", {
+      reply_markup: { inline_keyboard: buildKeyboard(matches, 0) }
+    });
+    return;
+  }
+
   const parsed = parseGitHubRepoUrl(text);
   if (!parsed) return;
 
   const { owner, repo } = parsed;
 
   try {
-    await bot.sendMessage(chatId, "⏳ Reading repository files…");
+    await bot.sendMessage(chatId, "⏳ Loading repository…");
 
     const branch = await getDefaultBranch(owner, repo);
     const sha = await getCommitSha(owner, repo, branch);
-    const files = await getAllFiles(owner, repo, sha);
+    const tree = await getTree(owner, repo, sha);
 
-    if (!files.length) {
-      await bot.sendMessage(chatId, "⚠️ No files found");
-      return;
-    }
+    const entries = getEntries(tree, "");
 
-    // Save session
-    sessions.set(chatId, { owner, repo, branch, files });
+    sessions.set(chatId, {
+      owner, repo, branch, tree,
+      path: "",
+      entries,
+      page: 0
+    });
 
-    // Build inline keyboard (max 10 buttons per message)
-    const keyboard = files.slice(0, 10).map((f, index) => ([
-      {
-        text: f.path.split("/").pop(),
-        callback_data: `file_${index}`
-      }
-    ]));
-
-    await bot.sendMessage(chatId, "📂 Select a file to download:", {
-      reply_markup: {
-        inline_keyboard: keyboard
-      }
+    await bot.sendMessage(chatId, "📂 Repository root:", {
+      reply_markup: { inline_keyboard: buildKeyboard(entries, 0) }
     });
 
   } catch (err) {
     console.error(err);
-    await bot.sendMessage(chatId, `❌ Error: ${err.message}`);
+    await bot.sendMessage(chatId, "❌ Failed to load repository");
   }
 });
 
 /* ===============================
-   BUTTON HANDLER
+   CALLBACK HANDLER
    =============================== */
 
-bot.on("callback_query", async (query) => {
-  const chatId = query.message.chat.id;
-  const data = query.data;
-
-  if (!data.startsWith("file_")) return;
-
-  const index = Number(data.split("_")[1]);
+bot.on("callback_query", async (q) => {
+  const chatId = q.message.chat.id;
+  const data = q.data;
   const session = sessions.get(chatId);
   if (!session) return;
 
-  const { owner, repo, branch, files } = session;
-  const file = files[index];
-  if (!file) return;
+  await bot.answerCallbackQuery(q.id);
 
-  try {
-    await bot.answerCallbackQuery(query.id);
-
+  // NAVIGATION
+  if (data === "nav:next") session.page++;
+  else if (data === "nav:prev") session.page--;
+  else if (data === "search") {
+    session.searching = true;
+    await bot.sendMessage(chatId, "🔎 Send file name to search:");
+    return;
+  }
+  // FOLDER
+  else if (data.startsWith("tree:")) {
+    session.path = data.split(":")[1];
+    session.entries = getEntries(session.tree, session.path);
+    session.page = 0;
+  }
+  // FILE
+  else if (data.startsWith("blob:")) {
+    const filePath = data.split(":")[1];
     const rawUrl =
-      `https://raw.githubusercontent.com/${owner}/${repo}/${branch}/${file.path}`;
+      `https://raw.githubusercontent.com/${session.owner}/${session.repo}/${session.branch}/${filePath}`;
 
     const r = await fetch(rawUrl);
     const buffer = Buffer.from(await r.arrayBuffer());
     const stream = Readable.from(buffer);
 
-    const safeFilename = file.path.replace(/\//g, "__");
-
-    // Send file
     await bot.sendDocument(chatId, stream, {
-      filename: safeFilename
+      filename: filePath.replace(/\//g, "__")
     });
-
-    // Send exact GitHub path
-    await bot.sendMessage(chatId, `📄 ${file.path}`);
-
-  } catch (err) {
-    console.error(err);
-    await bot.sendMessage(chatId, "❌ Failed to download file");
+    await bot.sendMessage(chatId, `📄 ${filePath}`);
+    return;
   }
+
+  await bot.editMessageReplyMarkup({
+    inline_keyboard: buildKeyboard(session.entries, session.page)
+  }, {
+    chat_id: chatId,
+    message_id: q.message.message_id
+  });
 });
 
 /* ===============================
