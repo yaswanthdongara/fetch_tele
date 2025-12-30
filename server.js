@@ -11,50 +11,113 @@ app.use(express.json());
 const bot = new TelegramBot(process.env.BOT_TOKEN);
 const PORT = process.env.PORT || 3000;
 
-// ---- WEBHOOK ----
+/* ===============================
+   BASIC ROUTES
+   =============================== */
+
+// Health check
+app.get("/", (req, res) => {
+  res.send("🤖 Telegram GitHub Repo Fetch Bot is running");
+});
+
+// Webhook
 app.post("/webhook", (req, res) => {
   bot.processUpdate(req.body);
   res.sendStatus(200);
 });
 
-// ---- START COMMAND ----
+/* ===============================
+   HELPER FUNCTIONS
+   =============================== */
+
+// Extract owner & repo from GitHub URL
+function parseRepoUrl(url) {
+  const match = url.match(/github\.com\/([^/]+)\/([^/]+)/);
+  if (!match) return null;
+  return { owner: match[1], repo: match[2] };
+}
+
+// Recursively fetch all files
+async function fetchFiles(owner, repo, path = "") {
+  const apiUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${path}`;
+  const response = await fetch(apiUrl);
+
+  if (!response.ok) {
+    throw new Error("GitHub API error");
+  }
+
+  const data = await response.json();
+  let files = [];
+
+  for (const item of data) {
+    if (item.type === "file") {
+      files.push({
+        name: item.name,
+        download_url: item.download_url
+      });
+    } else if (item.type === "dir") {
+      const subFiles = await fetchFiles(owner, repo, item.path);
+      files = files.concat(subFiles);
+    }
+  }
+
+  return files;
+}
+
+/* ===============================
+   BOT COMMANDS
+   =============================== */
+
+// Start command
 bot.onText(/\/start/, (msg) => {
   bot.sendMessage(
     msg.chat.id,
-    "👋 Send:\n/file <owner> <repo> <path>\n\nExample:\n/file octocat Hello-World README.md"
+    "👋 Send a GitHub repo URL:\n\n/repo https://github.com/username/repository"
   );
 });
 
-// ---- FILE COMMAND ----
-bot.onText(/\/file (.+)/, async (msg, match) => {
+// Repo command
+bot.onText(/\/repo (.+)/, async (msg, match) => {
   const chatId = msg.chat.id;
-  const [owner, repo, path] = match[1].split(" ");
+  const repoUrl = match[1];
 
-  if (!owner || !repo || !path) {
-    return bot.sendMessage(chatId, "❌ Invalid format");
+  const parsed = parseRepoUrl(repoUrl);
+  if (!parsed) {
+    return bot.sendMessage(chatId, "❌ Invalid GitHub repository URL");
   }
 
-  try {
-    const url = `https://api.github.com/repos/${owner}/${repo}/contents/${path}`;
-    const response = await fetch(url);
+  const { owner, repo } = parsed;
 
-    if (!response.ok) {
-      return bot.sendMessage(chatId, "❌ File not found");
+  try {
+    bot.sendMessage(chatId, "⏳ Fetching files, please wait...");
+
+    const files = await fetchFiles(owner, repo);
+
+    if (files.length === 0) {
+      return bot.sendMessage(chatId, "⚠️ No downloadable files found");
     }
 
-    const data = await response.json();
-    const fileBuffer = Buffer.from(data.content, "base64");
+    for (const file of files) {
+      const res = await fetch(file.download_url);
+      const buffer = await res.buffer();
 
-    await bot.sendDocument(chatId, fileBuffer, {}, {
-      filename: path
-    });
+      await bot.sendDocument(chatId, buffer, {}, {
+        filename: file.name
+      });
+    }
 
-  } catch (err) {
-    bot.sendMessage(chatId, "⚠️ Error fetching file");
+    bot.sendMessage(chatId, `✅ Sent ${files.length} files successfully`);
+
+  } catch (error) {
+    console.error(error);
+    bot.sendMessage(chatId, "❌ Error fetching repository files");
   }
 });
 
-// ---- SERVER ----
+/* ===============================
+   SERVER
+   =============================== */
+
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
