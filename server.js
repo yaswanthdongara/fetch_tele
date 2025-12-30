@@ -11,10 +11,13 @@ app.use(express.json());
 const bot = new TelegramBot(process.env.BOT_TOKEN);
 const PORT = process.env.PORT || 3000;
 
-/* ---------------- ROUTES ---------------- */
+const GH_HEADERS = {
+  "User-Agent": "telegram-github-bot",
+  "Accept": "application/vnd.github+json"
+};
 
 app.get("/", (req, res) => {
-  res.send("🤖 Telegram GitHub File Fetch Bot is running");
+  res.send("DIAGNOSTIC MODE ACTIVE");
 });
 
 app.post("/webhook", (req, res) => {
@@ -22,105 +25,66 @@ app.post("/webhook", (req, res) => {
   res.sendStatus(200);
 });
 
-/* ---------------- HELPERS ---------------- */
-
-function parseGitHubRepoUrl(text) {
-  const match = text.match(/^https?:\/\/github\.com\/([^/]+)\/([^/\s]+)/);
-  if (!match) return null;
-
-  return {
-    owner: match[1],
-    repo: match[2].replace(".git", "")
-  };
-}
-
-const GH_HEADERS = {
-  "User-Agent": "telegram-github-bot",
-  "Accept": "application/vnd.github+json"
-};
-
-async function getDefaultBranch(owner, repo) {
-  const res = await fetch(
-    `https://api.github.com/repos/${owner}/${repo}`,
-    { headers: GH_HEADERS }
-  );
-  if (!res.ok) throw new Error("Repo fetch failed");
-  const data = await res.json();
-  return data.default_branch;
-}
-
-async function getBranchCommitSha(owner, repo, branch) {
-  const res = await fetch(
-    `https://api.github.com/repos/${owner}/${repo}/git/refs/heads/${branch}`,
-    { headers: GH_HEADERS }
-  );
-  if (!res.ok) throw new Error("Branch ref fetch failed");
-  const data = await res.json();
-  return data.object.sha;
-}
-
-async function getAllFiles(owner, repo, commitSha) {
-  const res = await fetch(
-    `https://api.github.com/repos/${owner}/${repo}/git/trees/${commitSha}?recursive=1`,
-    { headers: GH_HEADERS }
-  );
-  if (!res.ok) throw new Error("Tree fetch failed");
-
-  const data = await res.json();
-  return data.tree.filter(item => item.type === "blob");
-}
-
-/* ---------------- BOT LOGIC ---------------- */
-
 bot.on("message", async (msg) => {
   const chatId = msg.chat.id;
   const text = msg.text;
 
   if (!text) return;
 
-  const parsed = parseGitHubRepoUrl(text);
-  if (!parsed) return;
+  const match = text.match(/^https?:\/\/github\.com\/([^/]+)\/([^/\s]+)/);
+  if (!match) return;
 
-  const { owner, repo } = parsed;
+  const owner = match[1];
+  const repo = match[2];
 
   try {
-    await bot.sendMessage(chatId, "⏳ Fetching repository files…");
-
-    const branch = await getDefaultBranch(owner, repo);
-    const commitSha = await getBranchCommitSha(owner, repo, branch);
-    const files = await getAllFiles(owner, repo, commitSha);
-
-    if (!files.length) {
-      return bot.sendMessage(chatId, "⚠️ No files found");
-    }
-
-    for (const file of files) {
-      const rawUrl = `https://raw.githubusercontent.com/${owner}/${repo}/${branch}/${file.path}`;
-
-      const res = await fetch(rawUrl);
-      if (!res.ok) continue;
-
-      const arrayBuffer = await res.arrayBuffer();
-      const buffer = Buffer.from(arrayBuffer);
-
-      await bot.sendDocument(chatId, buffer, {}, {
-        filename: file.path.split("/").pop()
-      });
-    }
+    // 1️⃣ Repo
+    const repoRes = await fetch(
+      `https://api.github.com/repos/${owner}/${repo}`,
+      { headers: GH_HEADERS }
+    );
+    const repoText = await repoRes.text();
 
     await bot.sendMessage(
       chatId,
-      `✅ Sent ${files.length} files successfully`
+      `REPO STATUS: ${repoRes.status}\n${repoText.slice(0, 350)}`
+    );
+
+    const repoJson = JSON.parse(repoText);
+    const branch = repoJson.default_branch;
+
+    // 2️⃣ Branch ref
+    const refRes = await fetch(
+      `https://api.github.com/repos/${owner}/${repo}/git/refs/heads/${branch}`,
+      { headers: GH_HEADERS }
+    );
+    const refText = await refRes.text();
+
+    await bot.sendMessage(
+      chatId,
+      `REF STATUS: ${refRes.status}\n${refText.slice(0, 350)}`
+    );
+
+    const refJson = JSON.parse(refText);
+    const sha = refJson.object.sha;
+
+    // 3️⃣ Tree
+    const treeRes = await fetch(
+      `https://api.github.com/repos/${owner}/${repo}/git/trees/${sha}?recursive=1`,
+      { headers: GH_HEADERS }
+    );
+    const treeText = await treeRes.text();
+
+    await bot.sendMessage(
+      chatId,
+      `TREE STATUS: ${treeRes.status}\n${treeText.slice(0, 350)}`
     );
 
   } catch (err) {
-    console.error(err);
-    bot.sendMessage(chatId, "❌ Failed to fetch repository files");
+    await bot.sendMessage(chatId, `❌ ERROR:\n${err.message}`);
   }
 });
 
-/* ---------------- SERVER ---------------- */
-
 app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+  console.log("Diagnostic server running");
 });
