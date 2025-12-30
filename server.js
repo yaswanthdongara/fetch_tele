@@ -11,64 +11,20 @@ app.use(express.json());
 const bot = new TelegramBot(process.env.BOT_TOKEN);
 const PORT = process.env.PORT || 3000;
 
-// 🔐 GitHub headers with token (THIS FIXES EVERYTHING)
 const GH_HEADERS = {
   "User-Agent": "telegram-github-bot",
   "Accept": "application/vnd.github+json",
-  "Authorization": `Bearer ${process.env.GITHUB_TOKEN}`
+  ...(process.env.GITHUB_TOKEN && {
+    "Authorization": `Bearer ${process.env.GITHUB_TOKEN}`
+  })
 };
 
-/* ---------------- ROUTES ---------------- */
-
-app.get("/", (req, res) => {
-  res.send("🤖 Telegram GitHub File Fetch Bot is running");
-});
+app.get("/", (req, res) => res.send("Bot running"));
 
 app.post("/webhook", (req, res) => {
   bot.processUpdate(req.body);
   res.sendStatus(200);
 });
-
-/* ---------------- HELPERS ---------------- */
-
-function parseGitHubRepoUrl(text) {
-  const match = text.match(/^https?:\/\/github\.com\/([^/]+)\/([^/\s]+)/);
-  if (!match) return null;
-
-  return {
-    owner: match[1],
-    repo: match[2].replace(".git", "")
-  };
-}
-
-async function getDefaultBranch(owner, repo) {
-  const res = await fetch(
-    `https://api.github.com/repos/${owner}/${repo}`,
-    { headers: GH_HEADERS }
-  );
-  const data = await res.json();
-  return data.default_branch;
-}
-
-async function getCommitSha(owner, repo, branch) {
-  const res = await fetch(
-    `https://api.github.com/repos/${owner}/${repo}/git/refs/heads/${branch}`,
-    { headers: GH_HEADERS }
-  );
-  const data = await res.json();
-  return data.object.sha;
-}
-
-async function getAllFiles(owner, repo, sha) {
-  const res = await fetch(
-    `https://api.github.com/repos/${owner}/${repo}/git/trees/${sha}?recursive=1`,
-    { headers: GH_HEADERS }
-  );
-  const data = await res.json();
-  return data.tree.filter(item => item.type === "blob");
-}
-
-/* ---------------- BOT LOGIC ---------------- */
 
 bot.on("message", async (msg) => {
   const chatId = msg.chat.id;
@@ -76,42 +32,70 @@ bot.on("message", async (msg) => {
 
   if (!text) return;
 
-  const parsed = parseGitHubRepoUrl(text);
-  if (!parsed) return;
+  const match = text.match(/^https?:\/\/github\.com\/([^/]+)\/([^/\s]+)/);
+  if (!match) return;
 
-  const { owner, repo } = parsed;
+  const owner = match[1];
+  const repo = match[2];
 
   try {
-    await bot.sendMessage(chatId, "⏳ Fetching repository files…");
+    // 🔎 DEBUG: confirm token
+    await bot.sendMessage(chatId, `TOKEN PRESENT: ${!!process.env.GITHUB_TOKEN}`);
 
-    const branch = await getDefaultBranch(owner, repo);
-    const sha = await getCommitSha(owner, repo, branch);
-    const files = await getAllFiles(owner, repo, sha);
+    const repoRes = await fetch(
+      `https://api.github.com/repos/${owner}/${repo}`,
+      { headers: GH_HEADERS }
+    );
 
-    for (const file of files) {
-      const rawUrl = `https://raw.githubusercontent.com/${owner}/${repo}/${branch}/${file.path}`;
+    if (!repoRes.ok) {
+      const t = await repoRes.text();
+      throw new Error(`REPO ${repoRes.status}: ${t}`);
+    }
 
-      const res = await fetch(rawUrl, { headers: GH_HEADERS });
-      if (!res.ok) continue;
+    const repoJson = await repoRes.json();
+    const branch = repoJson.default_branch;
 
-      const arrayBuffer = await res.arrayBuffer();
-      const buffer = Buffer.from(arrayBuffer);
+    const refRes = await fetch(
+      `https://api.github.com/repos/${owner}/${repo}/git/refs/heads/${branch}`,
+      { headers: GH_HEADERS }
+    );
 
-      await bot.sendDocument(chatId, buffer, {}, {
-        filename: file.path.split("/").pop()
+    if (!refRes.ok) {
+      const t = await refRes.text();
+      throw new Error(`REF ${refRes.status}: ${t}`);
+    }
+
+    const refJson = await refRes.json();
+    const sha = refJson.object.sha;
+
+    const treeRes = await fetch(
+      `https://api.github.com/repos/${owner}/${repo}/git/trees/${sha}?recursive=1`,
+      { headers: GH_HEADERS }
+    );
+
+    if (!treeRes.ok) {
+      const t = await treeRes.text();
+      throw new Error(`TREE ${treeRes.status}: ${t}`);
+    }
+
+    const treeJson = await treeRes.json();
+    const files = treeJson.tree.filter(f => f.type === "blob");
+
+    for (const f of files) {
+      const rawUrl = `https://raw.githubusercontent.com/${owner}/${repo}/${branch}/${f.path}`;
+      const r = await fetch(rawUrl);
+      const buf = Buffer.from(await r.arrayBuffer());
+
+      await bot.sendDocument(chatId, buf, {}, {
+        filename: f.path.split("/").pop()
       });
     }
 
     await bot.sendMessage(chatId, `✅ Sent ${files.length} files`);
 
   } catch (err) {
-    console.error(err);
-    bot.sendMessage(chatId, "❌ Failed to fetch repository files");
+    await bot.sendMessage(chatId, `❌ ERROR:\n${err.message.slice(0, 350)}`);
   }
 });
 
-/* ---------------- SERVER ---------------- */
-
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log("Server running"));
