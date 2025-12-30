@@ -2,11 +2,12 @@ import express from "express";
 import fetch from "node-fetch";
 import TelegramBot from "node-telegram-bot-api";
 import dotenv from "dotenv";
+import { Readable } from "stream";
 
 dotenv.config();
 
 /* ===============================
-   SETUP
+   BASIC SETUP
    =============================== */
 
 const app = express();
@@ -111,12 +112,13 @@ bot.on("message", async (msg) => {
       const r = await fetch(rawUrl);
       if (!r.ok) continue;
 
-      const buf = Buffer.from(await r.arrayBuffer());
-      if (!buf.length) continue;
+      const buffer = Buffer.from(await r.arrayBuffer());
+      if (!buffer.length) continue;
 
-      // ✅ THIS IS THE ONLY VALID WAY
-      await bot.sendDocument(chatId, {
-        source: buf,
+      // ✅ STREAM FIX (THIS SOLVES EVERYTHING)
+      const stream = Readable.from(buffer);
+
+      await bot.sendDocument(chatId, stream, {
         filename: f.path.split("/").pop()
       });
     }
