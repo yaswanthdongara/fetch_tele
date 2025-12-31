@@ -29,9 +29,8 @@ const GH_HEADERS = {
 /* ===============================
    SESSION STORE
    =============================== */
-
-const sessions = new Map(); 
-// chatId -> { owner, repo, branch, tree, path, page }
+// chatId -> { owner, repo, branch, tree, path, prevPath, entries, page, searching }
+const sessions = new Map();
 
 /* ===============================
    ROUTES
@@ -93,28 +92,42 @@ function getEntries(tree, path) {
   });
 }
 
-function buildKeyboard(entries, page) {
+/* ===============================
+   KEYBOARD BUILDER
+   =============================== */
+
+function buildKeyboard(entries, page, options = {}) {
   const PAGE_SIZE = 8;
   const start = page * PAGE_SIZE;
   const slice = entries.slice(start, start + PAGE_SIZE);
 
   const rows = slice.map(e => [{
-    text: e.type === "tree" ? `📂 ${e.path.split("/").pop()}` : `📄 ${e.path.split("/").pop()}`,
+    text: e.type === "tree"
+      ? `📂 ${e.path.split("/").pop()}`
+      : `📄 ${e.path.split("/").pop()}`,
     callback_data: `${e.type}:${e.path}`
   }]);
 
   const nav = [];
   if (page > 0) nav.push({ text: "⏮ Prev", callback_data: "nav:prev" });
   if (start + PAGE_SIZE < entries.length) nav.push({ text: "Next ⏭", callback_data: "nav:next" });
-
   if (nav.length) rows.push(nav);
-  rows.push([{ text: "🔎 Search", callback_data: "search" }]);
+
+  if (options.showBack) {
+    rows.push([{ text: "🔙 Back", callback_data: "nav:back" }]);
+  }
+
+  if (options.searching) {
+    rows.push([{ text: "❌ Cancel Search", callback_data: "search:cancel" }]);
+  } else {
+    rows.push([{ text: "🔎 Search", callback_data: "search" }]);
+  }
 
   return rows;
 }
 
 /* ===============================
-   BOT MESSAGE HANDLER
+   MESSAGE HANDLER
    =============================== */
 
 bot.on("message", async (msg) => {
@@ -122,26 +135,31 @@ bot.on("message", async (msg) => {
   const text = msg.text;
   if (!text) return;
 
-  // SEARCH MODE
   const session = sessions.get(chatId);
+
+  // SEARCH MODE
   if (session?.searching) {
     const keyword = text.toLowerCase();
     const matches = session.tree.filter(
       f => f.type === "blob" && f.path.toLowerCase().includes(keyword)
     );
 
-    if (!matches.length) {
-      await bot.sendMessage(chatId, "❌ No matching files found");
-      return;
-    }
-
-    session.entries = matches;
-    session.page = 0;
     session.searching = false;
+    session.entries = matches.length ? matches : session.entries;
+    session.page = 0;
 
-    await bot.sendMessage(chatId, "🔎 Search results:", {
-      reply_markup: { inline_keyboard: buildKeyboard(matches, 0) }
-    });
+    await bot.sendMessage(
+      chatId,
+      matches.length ? "🔎 Search results:" : "❌ No matching files found",
+      {
+        reply_markup: {
+          inline_keyboard: buildKeyboard(session.entries, 0, {
+            showBack: session.path !== "",
+            searching: false
+          })
+        }
+      }
+    );
     return;
   }
 
@@ -160,14 +178,21 @@ bot.on("message", async (msg) => {
     const entries = getEntries(tree, "");
 
     sessions.set(chatId, {
-      owner, repo, branch, tree,
+      owner,
+      repo,
+      branch,
+      tree,
       path: "",
+      prevPath: "",
       entries,
-      page: 0
+      page: 0,
+      searching: false
     });
 
     await bot.sendMessage(chatId, "📂 Repository root:", {
-      reply_markup: { inline_keyboard: buildKeyboard(entries, 0) }
+      reply_markup: {
+        inline_keyboard: buildKeyboard(entries, 0)
+      }
     });
 
   } catch (err) {
@@ -188,21 +213,36 @@ bot.on("callback_query", async (q) => {
 
   await bot.answerCallbackQuery(q.id);
 
-  // NAVIGATION
   if (data === "nav:next") session.page++;
   else if (data === "nav:prev") session.page--;
+  else if (data === "nav:back") {
+    session.path = session.prevPath || "";
+    session.prevPath = session.path.includes("/")
+      ? session.path.substring(0, session.path.lastIndexOf("/"))
+      : "";
+    session.entries = getEntries(session.tree, session.path);
+    session.page = 0;
+  }
   else if (data === "search") {
     session.searching = true;
-    await bot.sendMessage(chatId, "🔎 Send file name to search:");
+    await bot.sendMessage(chatId, "🔎 Send file name to search:", {
+      reply_markup: {
+        inline_keyboard: [[{ text: "❌ Cancel Search", callback_data: "search:cancel" }]]
+      }
+    });
     return;
   }
-  // FOLDER
+  else if (data === "search:cancel") {
+    session.searching = false;
+    session.entries = getEntries(session.tree, session.path);
+    session.page = 0;
+  }
   else if (data.startsWith("tree:")) {
+    session.prevPath = session.path;
     session.path = data.split(":")[1];
     session.entries = getEntries(session.tree, session.path);
     session.page = 0;
   }
-  // FILE
   else if (data.startsWith("blob:")) {
     const filePath = data.split(":")[1];
     const rawUrl =
@@ -220,7 +260,14 @@ bot.on("callback_query", async (q) => {
   }
 
   await bot.editMessageReplyMarkup({
-    inline_keyboard: buildKeyboard(session.entries, session.page)
+    inline_keyboard: buildKeyboard(
+      session.entries,
+      session.page,
+      {
+        showBack: session.path !== "",
+        searching: session.searching
+      }
+    )
   }, {
     chat_id: chatId,
     message_id: q.message.message_id
